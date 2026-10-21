@@ -1,0 +1,36 @@
+[package]
+name = "whip-whep-trickle-ice-repro"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+# Exactly one of the two: which gst-plugin-webrtc to test
+upstream = ["dep:gst-plugin-webrtc-upstream"]
+fork = ["dep:gst-plugin-webrtc-fork"]
+
+[dependencies]
+anyhow = "1"
+gst = { package = "gstreamer", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", branch = "main" }
+gst-sdp = { package = "gstreamer-sdp", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", branch = "main" }
+gst-webrtc = { package = "gstreamer-webrtc", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", branch = "main" }
+reqwest = { version = "0.12", default-features = false }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+# gst-plugins-rs main, the base of the fork branch
+[dependencies.gst-plugin-webrtc-upstream]
+package = "gst-plugin-webrtc"
+git = "https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs"
+rev = "9cb42da34f16dd4e2679495a8f546518d863e57c"
+default-features = false
+features = ["whip", "whep", "rustls-ring"]
+optional = true
+
+# webrtc-whip-whep-trickle-ice
+[dependencies.gst-plugin-webrtc-fork]
+package = "gst-plugin-webrtc"
+git = "https://gitlab.freedesktop.org/me5/gst-plugins-rs"
+rev = "f9c7317b53943deb42187c72e28adca8ec24c48a"
+default-features = false
+features = ["whip", "whep", "rustls-ring"]
+optional = true

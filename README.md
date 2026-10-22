@@ -26,7 +26,7 @@ The fix is in branch
 [`webrtc-whip-whep-trickle-ice`](https://gitlab.freedesktop.org/me5/gst-plugins-rs/-/commits/webrtc-whip-whep-trickle-ice)
 (two commits on top of `main` 9cb42da34).
 
-## The repro
+## The repro (command line)
 
 A Rust program with both sides in one process:
 
@@ -174,6 +174,78 @@ unknown session: 404 Not Found
 client ice-connection-state: Completed
 server ice-connection-state: Connected
 ```
+
+## Browser repro
+
+The same servers, with real browsers as clients:
+
+```sh
+cargo run --features upstream --bin web   # or --features fork
+# open http://127.0.0.1:8189/
+```
+
+`src/bin/web.rs` runs `whipserversrc` and `whepserversink` and serves the
+test page (`web/index.html`) on port 8189. It proxies `/whip/*` and
+`/whep/*` to the signallers (they send no CORS headers), and the page asks
+`/repro/session/{id}` which candidates the server handed to webrtcbin.
+
+On the page:
+
+- Pick **WHIP** to publish a canvas video and a tone (no camera
+  permission needed), or **WHEP** to play the server's test streams.
+- **Trickle ICE** sends the offer right away and PATCHes each candidate,
+  the way browser WHIP/WHEP clients do. Unchecked, the page waits for ICE
+  gathering and puts all candidates in the offer.
+- **No BUNDLE** removes `a=group:BUNDLE` from the offer, so that each
+  m-line has its own ICE transport. With BUNDLE, browsers only gather and
+  trickle for the first m-line, which hides the WHEP bug.
+- **Start**, then wait about 5 s. The page shows each PATCH status and
+  each candidate the server handed to webrtcbin, with the m-line it should
+  have gone to. Rows in red are wrong. **Stop** sends the DELETE; restart
+  the server if a session gets stuck.
+
+Browsers hide local addresses behind mDNS names (`….local`) unless the page
+has camera or microphone permission, so the candidates look like
+`candidate:0 1 UDP 2122252543 6e05….local 46581 typ host`.
+
+### Automated, with Playwright
+
+```sh
+cd web-test
+npm install
+npx playwright install chromium firefox
+node run.mjs   # server from above must be running
+```
+
+`run.mjs` runs WHIP and WHEP, each with and without BUNDLE, in Chromium and
+Firefox. Results on Linux (headless Chromium gathers one candidate per
+m-line, Firefox four):
+
+| | WHIP `main` | WHIP fork | WHEP `main` | WHEP fork |
+|---|---|---|---|---|
+| Chromium, no BUNDLE: PATCH statuses | `501` ×2 | `204` ×2 | `204` ×2 | `204` ×2 |
+| Chromium, no BUNDLE: handed to webrtcbin | none | `{0: 1, 1: 1}` | **`{0: 2}`**, 1 wrong | `{0: 1, 1: 1}` |
+| Firefox, no BUNDLE: PATCH statuses | `501` ×8 | `204` ×8 | `204` ×8 | `204` ×8 |
+| Firefox, no BUNDLE: handed to webrtcbin | none | `{0: 4, 1: 4}` | **`{0: 8}`**, 4 wrong | `{0: 4, 1: 4}` |
+| with BUNDLE (both browsers) | `501` | `204`, all on m-line 0 | `204`, all on m-line 0 | `204`, all on m-line 0 |
+
+ICE connected in every run.
+
+### On macOS
+
+Not tested on a Mac. With Homebrew:
+
+```sh
+brew install gstreamer libnice-gstreamer pkgconf
+gst-inspect-1.0 webrtcbin nicesrc vp8enc opusenc   # all four must exist
+cargo run --features upstream --bin web
+```
+
+Then open http://127.0.0.1:8189/ in Safari, Chrome or Firefox, or run the
+Playwright script. `run.mjs` also accepts `webkit`
+(`node run.mjs http://127.0.0.1:8189 chromium,firefox,webkit`), but that is
+untested: Playwright's WebKit didn't install on the Linux test machine.
+macOS may ask whether `web` may accept incoming connections; allow it.
 
 ## Side finding: webrtcsink deadlocks without BUNDLE
 

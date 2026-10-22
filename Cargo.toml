@@ -3,6 +3,7 @@ name = "whip-whep-trickle-ice-repro"
 version = "0.1.0"
 edition = "2024"
 publish = false
+default-run = "whip-whep-trickle-ice-repro"
 
 [features]
 # Exactly one of the two: which gst-plugin-webrtc to test
@@ -11,10 +12,13 @@ fork = ["dep:gst-plugin-webrtc-fork"]
 
 [dependencies]
 anyhow = "1"
+axum = "0.8"
 gst = { package = "gstreamer", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", branch = "main" }
 gst-sdp = { package = "gstreamer-sdp", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", branch = "main" }
 gst-webrtc = { package = "gstreamer-webrtc", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", branch = "main" }
 reqwest = { version = "0.12", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 
 # gst-plugins-rs main, the base of the fork branch

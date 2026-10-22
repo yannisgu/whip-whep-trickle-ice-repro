@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>WHIP/WHEP trickle ICE repro</title>
+<style>
+  body { font: 14px/1.4 system-ui, sans-serif; margin: 2em; max-width: 70em; }
+  fieldset { border: 1px solid #ccc; padding: 0.8em 1em; }
+  label { display: block; margin: 0.2em 0; }
+  button { font: inherit; padding: 0.3em 1em; margin-top: 0.5em; }
+  video { width: 320px; height: 240px; background: #222; display: block; margin: 1em 0; }
+  table { border-collapse: collapse; margin: 0.5em 0 1em; }
+  td, th { border: 1px solid #ddd; padding: 0.2em 0.5em; text-align: left; font: 12px ui-monospace, monospace; }
+  .bad { background: #fdd; }
+  .good { background: #dfd; }
+  #summary p { margin: 0.3em 0; }
+  pre { background: #f6f6f6; padding: 0.5em; font-size: 12px; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1>Trickle ICE against whipserversrc / whepserversink</h1>
+<p>Server: <b id="plugin">?</b></p>
+
+<fieldset>
+  <label><input type="radio" name="proto" value="whip" checked> WHIP: publish a canvas video and a tone to <code>whipserversrc</code></label>
+  <label><input type="radio" name="proto" value="whep"> WHEP: play video and audio from <code>whepserversink</code></label>
+  <label><input type="checkbox" id="trickle" checked> Trickle ICE: send the offer right away and PATCH each candidate
+    (off: wait for ICE gathering, all candidates in the offer)</label>
+  <label><input type="checkbox" id="nobundle" checked> No BUNDLE: remove <code>a=group:BUNDLE</code> from the offer,
+    so each m-line has its own ICE transport</label>
+  <button id="start">Start</button> <button id="stop" disabled>Stop</button>
+</fieldset>
+
+<video id="video" autoplay muted playsinline></video>
+<div id="summary"></div>
+<h3>PATCH requests</h3>
+<table id="patches"><tr><th>time</th><th>mid</th><th>candidate</th><th>status</th></tr></table>
+<h3>Candidates the server handed to webrtcbin</h3>
+<table id="server"><tr><th>m-line</th><th>mid</th><th>candidate</th><th>expected m-line</th></tr></table>
+<h3>Log</h3>
+<pre id="log"></pre>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let pc, resource, t0, stopDrawing;
+// Read by the Playwright test
+window.reproResult = null;
+
+const ms = () => Math.round(performance.now() - t0);
+function log(msg) {
+  const line = `${(ms() / 1000).toFixed(3)}s ${msg}`;
+  $("log").textContent += line + "\n";
+  console.log(line);
+}
+function row(table, cells, cls) {
+  const tr = $(table).insertRow();
+  if (cls) tr.className = cls;
+  for (const c of cells) tr.insertCell().textContent = c;
+}
+
+const info = fetch("/repro/info").then((r) => r.json());
+info.then((i) => ($("plugin").textContent = i.plugin));
+
+// The media sections of an SDP: mid, m= line, ICE credentials
+function sections(sdp) {
+  const lines = sdp.split(/\r?\n/);
+  const session = {};
+  const out = [];
+  let cur = session;
+  for (const l of lines) {
+    if (l.startsWith("m=")) {
+      cur = { m: l.slice(2), ufrag: session.ufrag, pwd: session.pwd };
+      out.push(cur);
+    } else if (l.startsWith("a=mid:")) cur.mid = l.slice(6);
+    else if (l.startsWith("a=ice-ufrag:")) cur.ufrag = l.slice(12);
+    else if (l.startsWith("a=ice-pwd:")) cur.pwd = l.slice(10);
+  }
+  return out;
+}
+
+// An application/trickle-ice-sdpfrag body (RFC 8840) for one media section
+function sdpfrag(section, lines) {
+  const [kind, , proto, fmt] = section.m.split(" ");
+  return [
+    `a=ice-ufrag:${section.ufrag}`,
+    `a=ice-pwd:${section.pwd}`,
+    `m=${kind} 9 ${proto} ${fmt}`,
+    `a=mid:${section.mid}`,
+    ...lines,
+  ].join("\r\n") + "\r\n";
+}
+
+function testMedia() {
+  const canvas = document.createElement("canvas");
+  canvas.width = 320;
+  canvas.height = 240;
+  const ctx = canvas.getContext("2d");
+  let frame = 0, running = true;
+  (function draw() {
+    if (!running) return;
+    ctx.fillStyle = "#246";
+    ctx.fillRect(0, 0, 320, 240);
+    ctx.fillStyle = "#fc4";
+    ctx.fillRect((frame++ * 4) % 320, 100, 40, 40);
+    requestAnimationFrame(draw);
+  })();
+  const audio = new AudioContext();
+  const osc = audio.createOscillator();
+  const dest = audio.createMediaStreamDestination();
+  osc.connect(dest);
+  osc.start();
+  stopDrawing = () => { running = false; audio.close(); };
+  return [canvas.captureStream(15).getVideoTracks()[0], dest.stream.getAudioTracks()[0]];
+}
+
+async function start() {
+  const proto = document.querySelector("input[name=proto]:checked").value;
+  const trickle = $("trickle").checked;
+  const nobundle = $("nobundle").checked;
+  $("start").disabled = true;
+  $("stop").disabled = false;
+  $("log").textContent = "";
+  $("summary").innerHTML = "";
+  for (const t of ["patches", "server"]) while ($(t).rows.length > 1) $(t).deleteRow(1);
+  t0 = performance.now();
+
+  const result = (window.reproResult = {
+    proto, trickle, nobundle, plugin: (await info).plugin,
+    offerCandidates: 0, patches: [], connectedMs: null, gatheringCompleteMs: null,
+    session: null, mids: [], server: [], done: false, error: null,
+  });
+
+  try {
+    pc = new RTCPeerConnection({ bundlePolicy: nobundle ? "max-compat" : "max-bundle" });
+    pc.oniceconnectionstatechange = () => {
+      log(`ice-connection-state ${pc.iceConnectionState}`);
+      if (["connected", "completed"].includes(pc.iceConnectionState) && result.connectedMs == null)
+        result.connectedMs = ms();
+    };
+    pc.onicegatheringstatechange = () => {
+      log(`ice-gathering-state ${pc.iceGatheringState}`);
+      if (pc.iceGatheringState == "complete") result.gatheringCompleteMs = ms();
+    };
+
+    if (proto == "whip") {
+      for (const track of testMedia()) pc.addTransceiver(track, { direction: "sendonly" });
+    } else {
+      pc.addTransceiver("video", { direction: "recvonly" });
+      pc.addTransceiver("audio", { direction: "recvonly" });
+      const stream = new MediaStream();
+      pc.ontrack = (e) => { stream.addTrack(e.track); $("video").srcObject = stream; };
+    }
+
+    // Candidates gathered before the server answered wait here, then go out
+    // one PATCH at a time, in order
+    const pending = [];
+    let sent = Promise.resolve();
+    const patch = (mid, line) => {
+      sent = sent.then(async () => {
+        const section = sections(pc.localDescription.sdp).find((s) => s.mid == mid);
+        const resp = await fetch(resource, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/trickle-ice-sdpfrag" },
+          body: sdpfrag(section, [line]),
+        });
+        const p = { ms: ms(), mid, candidate: line, status: resp.status };
+        result.patches.push(p);
+        row("patches", [`${(p.ms / 1000).toFixed(3)}s`, mid, line, resp.status], resp.ok ? "good" : "bad");
+      });
+    };
+    const send = (mid, line) => (resource ? patch(mid, line) : pending.push([mid, line]));
+    pc.onicecandidate = (e) => {
+      if (!trickle) return;
+      if (e.candidate && e.candidate.candidate) send(e.candidate.sdpMid, `a=${e.candidate.candidate}`);
+      else if (!e.candidate)
+        for (const s of sections(pc.localDescription.sdp)) send(s.mid, "a=end-of-candidates");
+    };
+
+    await pc.setLocalDescription(await pc.createOffer());
+    if (!trickle) {
+      log("waiting for ICE gathering to complete");
+      await new Promise((resolve) => {
+        if (pc.iceGatheringState == "complete") resolve();
+        pc.addEventListener("icegatheringstatechange", () => pc.iceGatheringState == "complete" && resolve());
+      });
+    }
+
+    let offer = pc.localDescription.sdp;
+    if (nobundle) offer = offer.replace(/a=group:BUNDLE[^\r\n]*\r?\n/, "");
+    result.mids = sections(offer).map((s) => s.mid);
+    result.offerCandidates = (offer.match(/^a=candidate:/gm) || []).length;
+    log(`POST /${proto}/endpoint: offer with ${result.offerCandidates} candidate(s), mids ${result.mids.join(", ")}`);
+    const resp = await fetch(`/${proto}/endpoint`, {
+      method: "POST",
+      headers: { "Content-Type": "application/sdp" },
+      body: offer,
+    });
+    if (resp.status != 201) throw new Error(`POST: ${resp.status} ${await resp.text()}`);
+    resource = resp.headers.get("Location");
+    result.session = resource.split("/").pop();
+    log(`${resp.status}, session ${resource}`);
+    await pc.setRemoteDescription({ type: "answer", sdp: await resp.text() });
+    for (const [mid, line] of pending.splice(0)) patch(mid, line);
+
+    // Give ICE and the PATCHes time, then ask the server what it did
+    await new Promise((r) => setTimeout(r, 5000));
+    await sent;
+    result.server = await (await fetch(`/repro/session/${result.session}`)).json();
+    // The server handles the PATCHes in order, so match its candidates to
+    // them in order: browsers may send the same candidate line for two mids
+    const unmatched = [...result.patches];
+    for (const t of result.server) {
+      const i = unmatched.findIndex((p) => p.candidate.includes(t.candidate.replace(/^a=/, "")));
+      const sent = i >= 0 ? unmatched.splice(i, 1)[0] : null;
+      // The m-line of the candidate's mid in the client's offer
+      t.expected = sent ? result.mids.indexOf(sent.mid) : null;
+      row("server", [t.mline, t.mid ?? "(none)", t.candidate, t.expected ?? "?"],
+          t.expected == null || t.expected == t.mline ? "good" : "bad");
+    }
+    summarize(result);
+  } catch (err) {
+    result.error = String(err);
+    log(`error: ${err}`);
+    $("summary").innerHTML = `<p class="bad">Error: ${err}</p>`;
+  }
+  result.done = true;
+}
+
+function summarize(r) {
+  const trickled = r.patches.filter((p) => !p.candidate.includes("end-of-candidates"));
+  const accepted = trickled.filter((p) => p.status >= 200 && p.status < 300).length;
+  const wrong = r.server.filter((t) => t.expected != null && t.expected != t.mline).length;
+  const perMline = {};
+  for (const t of r.server) perMline[t.mline] = (perMline[t.mline] || 0) + 1;
+  const p = (text, ok) => `<p class="${ok ? "good" : "bad"}">${text}</p>`;
+  $("summary").innerHTML = [
+    `<p>${r.proto.toUpperCase()}, ${r.trickle ? "trickle ICE" : "waited for gathering"}, ${r.nobundle ? "no BUNDLE" : "BUNDLE"}:
+       offer with ${r.offerCandidates} candidate(s), ICE connected after ${r.connectedMs ?? "-"} ms,
+       gathering complete after ${r.gatheringCompleteMs ?? "-"} ms</p>`,
+    r.trickle ? p(`Trickled candidates accepted: ${accepted}/${trickled.length}`, accepted == trickled.length) : "",
+    r.trickle ? p(`Handed to the server's webrtcbin per m-line: ${JSON.stringify(perMline)}, ${wrong} on the wrong m-line`,
+                  r.server.length == trickled.length && wrong == 0) : "",
+    p(`ICE ${r.connectedMs != null ? "connected" : "not connected"}`, r.connectedMs != null),
+  ].join("");
+}
+
+async function stop() {
+  $("stop").disabled = true;
+  if (resource) await fetch(resource, { method: "DELETE" }).catch(() => {});
+  pc?.close();
+  stopDrawing?.();
+  resource = null;
+  $("start").disabled = false;
+}
+
+$("start").onclick = start;
+$("stop").onclick = stop;
+
+// ?proto=whep&trickle=0&nobundle=0&run=1 for scripted runs
+const q = new URLSearchParams(location.search);
+if (q.has("proto")) document.querySelector(`input[name=proto][value=${q.get("proto")}]`).checked = true;
+if (q.has("trickle")) $("trickle").checked = q.get("trickle") == "1";
+if (q.has("nobundle")) $("nobundle").checked = q.get("nobundle") == "1";
+if (q.get("run") == "1") start();
+</script>
+</body>
+</html>

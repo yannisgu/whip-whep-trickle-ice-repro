@@ -3,17 +3,25 @@
 use anyhow::{Context, Result, anyhow};
 use gst::glib;
 use gst::prelude::*;
-use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 pub struct Server {
     pub pipeline: gst::Pipeline,
     /// The session's webrtcbin, once the client has connected
     pub webrtcbin: Arc<Mutex<Option<gst::Element>>>,
-    /// How many candidates the signaller handed to webrtcbin, per m-line
-    pub candidates: Arc<Mutex<BTreeMap<u32, usize>>>,
+    /// Every candidate the signaller handed to webrtcbin
+    pub trickled: Arc<Mutex<Vec<Trickled>>>,
     /// The URL the WHIP/WHEP paths are relative to
     pub base: String,
+}
+
+/// A `handle-ice` of the server's signaller
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct Trickled {
+    pub session: String,
+    pub mline: u32,
+    pub mid: Option<String>,
+    pub candidate: String,
 }
 
 /// `whipserversrc` receiving into fakesinks
@@ -24,7 +32,7 @@ pub fn whip() -> Result<Server> {
         .build()?;
     let signaller = src.property::<glib::Object>("signaller");
     signaller.set_property("host-addr", "http://127.0.0.1:8190");
-    let candidates = tap_handle_ice(&signaller);
+    let trickled = tap_handle_ice(&signaller);
     pipeline.add(&src)?;
 
     let pipeline_weak = pipeline.downgrade();
@@ -53,7 +61,7 @@ pub fn whip() -> Result<Server> {
     Ok(Server {
         pipeline,
         webrtcbin,
-        candidates,
+        trickled,
         base: "http://127.0.0.1:8190/whip".into(),
     })
 }
@@ -76,7 +84,7 @@ pub fn whep() -> Result<Server> {
     sink.set_property("stun-server", None::<String>);
     let signaller = sink.property::<glib::Object>("signaller");
     signaller.set_property("host-addr", "http://127.0.0.1:8191");
-    let candidates = tap_handle_ice(&signaller);
+    let trickled = tap_handle_ice(&signaller);
 
     // webrtcsink runs each session's webrtcbin in a pipeline of its own
     let webrtcbin = Arc::new(Mutex::new(None));
@@ -91,25 +99,31 @@ pub fn whep() -> Result<Server> {
     Ok(Server {
         pipeline,
         webrtcbin,
-        candidates,
+        trickled,
         base: "http://127.0.0.1:8191/whep".into(),
     })
 }
 
-/// Logs and counts what the server's signaller hands to webrtcbin
-fn tap_handle_ice(signaller: &glib::Object) -> Arc<Mutex<BTreeMap<u32, usize>>> {
-    let candidates = Arc::new(Mutex::new(BTreeMap::new()));
-    let counts = candidates.clone();
+/// Logs and records what the server's signaller hands to webrtcbin
+fn tap_handle_ice(signaller: &glib::Object) -> Arc<Mutex<Vec<Trickled>>> {
+    let trickled = Arc::new(Mutex::new(vec![]));
+    let record = trickled.clone();
     signaller.connect("handle-ice", false, move |args| {
+        let session = args[1].get::<String>().unwrap();
         let mline = args[2].get::<u32>().unwrap();
-        *counts.lock().unwrap().entry(mline).or_default() += 1;
         let mid = args[3].get::<Option<String>>().unwrap();
         let candidate = args[4].get::<String>().unwrap();
         log!(
             "server",
             "handle-ice m-line {mline} mid {mid:?}: {candidate}"
         );
+        record.lock().unwrap().push(Trickled {
+            session,
+            mline,
+            mid,
+            candidate,
+        });
         None
     });
-    candidates
+    trickled
 }

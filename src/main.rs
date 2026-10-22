@@ -11,38 +11,11 @@
 //! cargo run --features upstream -- whip|whep
 //! cargo run --features fork -- whip|whep
 
-#[cfg(all(feature = "upstream", feature = "fork"))]
-compile_error!("enable only one of the features `upstream` and `fork`");
-#[cfg(not(any(feature = "upstream", feature = "fork")))]
-compile_error!("enable one of the features `upstream` and `fork`");
-
 use anyhow::{Result, bail};
 use gst::prelude::*;
-use std::sync::LazyLock;
-use std::time::{Duration, Instant};
-
-static START: LazyLock<Instant> = LazyLock::new(Instant::now);
-
-macro_rules! log {
-    ($who:expr, $($arg:tt)*) => {
-        println!("{:>6.3}s [{}] {}", $crate::START.elapsed().as_secs_f64(), $who, format!($($arg)*))
-    };
-}
-
-mod client;
-mod server;
-
-const PLUGIN: &str = if cfg!(feature = "upstream") {
-    "upstream main (9cb42da34)"
-} else {
-    "fork webrtc-whip-whep-trickle-ice (f9c7317b5)"
-};
-
-#[derive(Clone, Copy, PartialEq)]
-enum Mode {
-    Whip,
-    Whep,
-}
+use std::collections::BTreeMap;
+use std::time::Duration;
+use whip_whep_trickle_ice_repro::{Mode, PLUGIN, client, server};
 
 fn main() -> Result<()> {
     let mode = match std::env::args().nth(1).as_deref() {
@@ -51,14 +24,7 @@ fn main() -> Result<()> {
         _ => bail!("usage: whip-whep-trickle-ice-repro whip|whep"),
     };
 
-    gst::init()?;
-    #[cfg(feature = "upstream")]
-    gst_plugin_webrtc_upstream::plugin_register_static()?;
-    #[cfg(feature = "fork")]
-    gst_plugin_webrtc_fork::plugin_register_static()?;
-    LazyLock::force(&START);
-
-    println!("gst-plugin-webrtc: {PLUGIN}, {}", gst::version_string());
+    whip_whep_trickle_ice_repro::init()?;
 
     let server = match mode {
         Mode::Whip => server::whip()?,
@@ -71,7 +37,10 @@ fn main() -> Result<()> {
 
     let runtime = tokio::runtime::Runtime::new()?;
     let trickled = runtime.block_on(client.trickle(&server.base))?;
-    let candidates = server.candidates.lock().unwrap().clone();
+    let mut candidates = BTreeMap::<u32, usize>::new();
+    for trickled in server.trickled.lock().unwrap().iter() {
+        *candidates.entry(trickled.mline).or_default() += 1;
+    }
     let edge_cases = runtime.block_on(async {
         let edge_cases = client.edge_cases(&server.base).await?;
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -108,12 +77,4 @@ fn main() -> Result<()> {
     client.pipeline.set_state(gst::State::Null)?;
     server.pipeline.set_state(gst::State::Null)?;
     Ok(())
-}
-
-fn watch_ice_state(who: &'static str, webrtcbin: &gst::Element) {
-    webrtcbin.connect_notify(Some("ice-connection-state"), move |webrtcbin, _| {
-        let state =
-            webrtcbin.property::<gst_webrtc::WebRTCICEConnectionState>("ice-connection-state");
-        log!(who, "ice-connection-state {state:?}");
-    });
 }

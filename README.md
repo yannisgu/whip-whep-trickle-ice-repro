@@ -24,7 +24,17 @@ With gst-plugins-rs `main`:
 
 The fix is in branch
 [`webrtc-whip-whep-trickle-ice`](https://gitlab.freedesktop.org/me5/gst-plugins-rs/-/commits/webrtc-whip-whep-trickle-ice)
-(two commits on top of `main` 9cb42da34).
+of the fork. Both servers then handle trickle ICE the same way:
+
+- They hand each candidate to the m-line named by the `a=mid` of its media
+  section. Candidates before the first `m=` line go to the first media
+  section.
+- They send an `ETag` with the SDP answer and require it in the `If-Match`
+  header of each PATCH, as RFC 9725 asks: `428` without `If-Match`, `412`
+  with another entity-tag.
+- They answer `422` to ICE restarts, which they don't support, `404` for
+  unknown sessions, `409` before the session has the client's SDP, and
+  `400` for fragments that don't match the session.
 
 ## The repro (command line)
 
@@ -37,18 +47,19 @@ A Rust program with both sides in one process:
   - It POSTs its offer before it has gathered any candidate and applies
     the answer right away.
   - For 4 s, it PATCHes each candidate in its own fragment (`a=ice-ufrag`,
-    `a=ice-pwd`, `m=`, `a=mid`, `a=candidate`), plus `a=end-of-candidates`.
-  - Then it sends three more PATCHes: a fragment with only the candidates
-    of the last media section, an ICE restart (another `ice-ufrag`), and a
-    PATCH for an unknown session.
+    `a=ice-pwd`, `m=`, `a=mid`, `a=candidate`), plus `a=end-of-candidates`,
+    with the answer's `ETag` in `If-Match` if there is one.
+  - Then it sends the edge cases one at a time, listed in the table below.
 - **`src/main.rs`**: starts both and prints the summary.
 
 The WHIP client sends one video stream (max-bundle). The WHEP client
 receives video and audio with `bundle-policy=none`, so that each m-line has
-its own ICE transport.
+its own ICE transport and its own ICE credentials.
 
-The features `upstream` and `fork` choose the gst-plugin-webrtc to test,
-both pinned by commit:
+The features `upstream` and `fork` choose the gst-plugin-webrtc to test:
+`main` of gst-plugins-rs, or the fork branch. Both follow their branch, and
+`Cargo.lock` isn't committed, so a fresh clone builds the latest of each.
+Run `cargo update` to pick up new commits in an existing checkout.
 
 ```sh
 cargo run --features upstream -- whip   # or whep
@@ -62,117 +73,61 @@ Opus (tested with 1.28.7 on Linux), and Rust ≥ 1.92.
 
 ## Results
 
-The number of candidates depends on the host's network interfaces; this
-host gathers 17 per m-line. Addresses below are replaced by documentation
-addresses.
+The number of candidates depends on the host's network interfaces; the
+test host gathers 15 per m-line. The same on every run:
 
 | | WHIP `main` | WHIP fork | WHEP `main` | WHEP fork |
 |---|---|---|---|---|
-| trickled candidates | `501` (0/17) | `204` (17/17) | `204` (34/34) | `204` (34/34) |
-| handed to webrtcbin, per m-line | none | `{0: 17}` | **`{0: 34}`** | `{0: 17, 1: 17}` |
-| ICE restart | `501` | `422` | **`204`** | `422` |
-| unknown session | `501` | `404` | **`204`** | `404` |
+| trickled candidates | `501` (0/15) | `204` (15/15) | `204` (30/30) | `204` (30/30) |
+| handed to webrtcbin, per m-line | none | `{0: 15}` | **`{0: 30}`** | `{0: 15, 1: 15}` |
+| fragment with only the last mid | | | `204`, **m-line 0** | `204`, m-line 1 |
+| candidate before any `m=` line | `501` | `204`, m-line 0 | `204`, **dropped** | `204`, m-line 0 |
+| `If-Match: *` | `501` | `204` | `204` | `204` |
+| no `If-Match` | `501` | `428` | **`204`** | `428` |
+| wrong `If-Match` | `501` | `412` | **`204`** | `412` |
+| ICE restart (other `ice-ufrag`) | `501` | `422` | **`204`**, handed to webrtcbin | `422` |
+| unknown session | `501` | `404` | **`204`**, handed to webrtcbin | `404` |
 
-These are the same on every run. ICE connects in all four on localhost:
-without the trickled candidates, the server still learns the client's
-address from the client's connectivity checks (peer-reflexive candidates).
-Which pair ICE selects, and whether the server reports its remote candidate
-as `host` or `prflx`, depends on timing, so the repro doesn't report it.
+The WHIP client has only one m-line, so it has no "only the last mid" case.
 
-### WHIP, `main`
+ICE connects in all four on localhost: without the trickled candidates,
+the server still learns the client's address from the client's
+connectivity checks (peer-reflexive candidates). Which pair ICE selects,
+and whether the server reports its remote candidate as `host` or `prflx`,
+depends on timing, so the repro doesn't report it.
 
-```
- 0.041s [client] POST http://127.0.0.1:8190/whip/endpoint: offer with 0 candidate(s)
- 0.073s [client] 201 Created, session http://127.0.0.1:8190/whip/resource/5de5e440-e031-40ad-93e4-6da5920dbe63
- 0.073s [client] PATCH m-line 0 (mid video0) candidate:1 1 UDP 2015363327 192.0.2.10 55952 typ host -> 501 Not Implemented
- 0.074s [client] PATCH m-line 0 (mid video0) candidate:2 1 UDP 2015363583 192.0.2.11 60840 typ host -> 501 Not Implemented
- …
- 0.086s [client] PATCH m-line 0 (mid video0) end-of-candidates -> 501 Not Implemented
-
-=== WHIP with upstream main (9cb42da34)
-trickled candidates accepted: 0/17
-candidates handed to the server's webrtcbin, per m-line: {}
-ICE restart (new ice-ufrag): 501 Not Implemented
-unknown session: 501 Not Implemented
-client ice-connection-state: Connected
-server ice-connection-state: Completed
-```
-
-### WHIP, fork
+`./compare.sh` prints, for WHEP with the fork:
 
 ```
- 0.068s [client] POST http://127.0.0.1:8190/whip/endpoint: offer with 0 candidate(s)
- 0.115s [client] 201 Created, session http://127.0.0.1:8190/whip/resource/d26e8936-c5cf-4f28-9c12-d73321b7f004
- 0.116s [server] handle-ice m-line 0 mid Some("video0"): candidate:1 1 UDP 2015363327 192.0.2.10 42771 typ host
- 0.119s [client] PATCH m-line 0 (mid video0) candidate:1 1 UDP 2015363327 192.0.2.10 42771 typ host -> 204 No Content
- …
- 0.211s [client] PATCH m-line 0 (mid video0) end-of-candidates -> 204 No Content
-
-=== WHIP with fork webrtc-whip-whep-trickle-ice (f9c7317b5)
-trickled candidates accepted: 17/17
-candidates handed to the server's webrtcbin, per m-line: {0: 17}
-ICE restart (new ice-ufrag): 422 Unprocessable Entity
-unknown session: 404 Not Found
-client ice-connection-state: Connected
-server ice-connection-state: Completed
-```
-
-### WHEP, `main`
-
-The audio candidates (mid `audio1`) are handed to webrtcbin as m-line 0:
-
-```
- 0.085s [client] POST http://127.0.0.1:8191/whep/endpoint: offer with 0 candidate(s)
- 0.429s [client] 201 Created, session http://127.0.0.1:8191/whep/resource/e3edeb2e-1ff8-4bbf-9a25-02e112870083
- 0.432s [server] handle-ice m-line 0 mid None: a=candidate:1 1 UDP 2015363327 192.0.2.10 55263 typ host
- 0.432s [client] PATCH m-line 0 (mid video0) candidate:1 1 UDP 2015363327 192.0.2.10 55263 typ host -> 204 No Content
- …
- 0.450s [client] PATCH m-line 0 (mid video0) candidate:17 1 UDP 2015367423 2001:db8::1a 36277 typ host -> 204 No Content
- 0.451s [client] PATCH m-line 0 (mid video0) end-of-candidates -> 204 No Content
- 0.452s [server] handle-ice m-line 0 mid None: a=candidate:1 1 UDP 2015363327 192.0.2.10 43704 typ host
- 0.453s [client] PATCH m-line 1 (mid audio1) candidate:1 1 UDP 2015363327 192.0.2.10 43704 typ host -> 204 No Content
- …
- 4.431s [server] handle-ice m-line 0 mid None: a=candidate:9999 1 UDP 2122260223 192.0.2.1 50000 typ host
- 4.434s [server] handle-ice m-line 0 mid None: a=candidate:9999 1 UDP 2122260223 192.0.2.1 50000 typ host
- 4.437s [server] handle-ice m-line 0 mid None: a=candidate:9999 1 UDP 2122260223 192.0.2.1 50000 typ host
-
-=== WHEP with upstream main (9cb42da34)
-trickled candidates accepted: 34/34
-candidates handed to the server's webrtcbin, per m-line: {0: 34}
-fragment with only mid audio1 (m-line 1): 204 No Content
-ICE restart (new ice-ufrag): 204 No Content
-unknown session: 204 No Content
-client ice-connection-state: Connected
-server ice-connection-state: Completed
-```
-
-The three `192.0.2.1` lines are the last three PATCHes: the `audio1`-only
-fragment, the ICE restart, and the unknown session. All three reach
-webrtcbin as m-line 0.
-
-### WHEP, fork
-
-```
- 0.086s [client] POST http://127.0.0.1:8191/whep/endpoint: offer with 0 candidate(s)
- 0.406s [client] 201 Created, session http://127.0.0.1:8191/whep/resource/b3121184-3f33-406f-ba96-494f4afb7e7a
- 0.408s [server] handle-ice m-line 0 mid Some("video0"): candidate:1 1 UDP 2015363327 192.0.2.10 57671 typ host
- 0.410s [client] PATCH m-line 0 (mid video0) candidate:1 1 UDP 2015363327 192.0.2.10 57671 typ host -> 204 No Content
- …
- 0.499s [client] PATCH m-line 0 (mid video0) candidate:17 1 UDP 2015367423 2001:db8::1a 50607 typ host -> 204 No Content
- 0.506s [client] PATCH m-line 0 (mid video0) end-of-candidates -> 204 No Content
- 0.510s [server] handle-ice m-line 1 mid Some("audio1"): candidate:1 1 UDP 2015363327 192.0.2.10 49237 typ host
- 0.513s [client] PATCH m-line 1 (mid audio1) candidate:1 1 UDP 2015363327 192.0.2.10 49237 typ host -> 204 No Content
- …
- 4.409s [server] handle-ice m-line 1 mid Some("audio1"): candidate:9999 1 UDP 2122260223 192.0.2.1 50000 typ host
-
-=== WHEP with fork webrtc-whip-whep-trickle-ice (f9c7317b5)
-trickled candidates accepted: 34/34
-candidates handed to the server's webrtcbin, per m-line: {0: 17, 1: 17}
-fragment with only mid audio1 (m-line 1): 204 No Content
-ICE restart (new ice-ufrag): 422 Unprocessable Entity
-unknown session: 404 Not Found
+=== WHEP with fork webrtc-whip-whep-trickle-ice
+trickled candidates accepted: 30/30
+candidates handed to the server's webrtcbin, per m-line: {0: 15, 1: 15}
+fragment with only mid audio1 (m-line 1): 204 No Content, handed to m-line(s) [1]
+candidate before the first m= line, no m= line: 204 No Content, handed to m-line(s) [0]
+If-Match: *: 204 No Content, handed to m-line(s) [0]
+no If-Match: 428 Precondition Required, handed to m-line(s) []
+wrong If-Match: 412 Precondition Failed, handed to m-line(s) []
+ICE restart (new ice-ufrag): 422 Unprocessable Entity, handed to m-line(s) []
+unknown session: 404 Not Found, handed to m-line(s) []
 client ice-connection-state: Completed
-server ice-connection-state: Connected
+server ice-connection-state: Completed
+```
+
+and with `main`:
+
+```
+=== WHEP with upstream main
+trickled candidates accepted: 30/30
+candidates handed to the server's webrtcbin, per m-line: {0: 30}
+fragment with only mid audio1 (m-line 1): 204 No Content, handed to m-line(s) [0]
+candidate before the first m= line, no m= line: 204 No Content, handed to m-line(s) []
+If-Match: *: 204 No Content, handed to m-line(s) [0]
+no If-Match: 204 No Content, handed to m-line(s) [0]
+wrong If-Match: 204 No Content, handed to m-line(s) [0]
+ICE restart (new ice-ufrag): 204 No Content, handed to m-line(s) [0]
+unknown session: 204 No Content, handed to m-line(s) [0]
+client ice-connection-state: Completed
+server ice-connection-state: Completed
 ```
 
 ## Browser repro
@@ -201,8 +156,10 @@ On the page:
   trickle for the first m-line, which hides the WHEP bug.
 - **Start**, then wait about 5 s. The page shows each PATCH status and
   each candidate the server handed to webrtcbin, with the m-line it should
-  have gone to. Rows in red are wrong. **Stop** sends the DELETE; restart
-  the server if a session gets stuck.
+  have gone to. Then it sends the same edge cases as the command-line
+  client and shows each status next to what the fork answers. Rows in red
+  are wrong. **Stop** sends the DELETE; restart the server if a session
+  gets stuck.
 
 Browsers hide local addresses behind mDNS names (`….local`) unless the page
 has camera or microphone permission, so the candidates look like
@@ -218,8 +175,8 @@ node run.mjs   # server from above must be running
 ```
 
 `run.mjs` runs WHIP and WHEP, each with and without BUNDLE, in Chromium and
-Firefox. Results on Linux (headless Chromium gathers one candidate per
-m-line, Firefox four):
+Firefox, and prints `ok` or `FAIL` for each edge case. Results on Linux
+(headless Chromium gathers one candidate per m-line, Firefox four):
 
 | | WHIP `main` | WHIP fork | WHEP `main` | WHEP fork |
 |---|---|---|---|---|
@@ -228,24 +185,34 @@ m-line, Firefox four):
 | Firefox, no BUNDLE: PATCH statuses | `501` ×8 | `204` ×8 | `204` ×8 | `204` ×8 |
 | Firefox, no BUNDLE: handed to webrtcbin | none | `{0: 4, 1: 4}` | **`{0: 8}`**, 4 wrong | `{0: 4, 1: 4}` |
 | with BUNDLE (both browsers) | `501` | `204`, all on m-line 0 | `204`, all on m-line 0 | `204`, all on m-line 0 |
+| edge cases, all 8 runs | 52 of 56 fail | 56 ok | | |
 
 ICE connected in every run.
 
+Browsers use the same ICE credentials for every m-line, even without
+BUNDLE. The command-line WHEP client has different ones per m-line, which
+only it tests: a fragment for m-line 1 starts with m-line 1's credentials,
+which aren't an ICE restart.
+
 ### On macOS
 
-Not tested on a Mac. With Homebrew:
+Tested on macOS 26 (Apple silicon) with the official GStreamer 1.28.7
+installer, by hand in the browser:
 
 ```sh
-brew install gstreamer libnice-gstreamer pkgconf
-gst-inspect-1.0 webrtcbin nicesrc vp8enc opusenc   # all four must exist
-cargo run --features upstream --bin web
+F=/Library/Frameworks/GStreamer.framework/Versions/1.0
+$F/bin/gst-inspect-1.0 webrtcbin nicesrc vp8enc opusenc   # all four must exist
+PKG_CONFIG_PATH=$F/lib/pkgconfig cargo build --features upstream --bin web
+install_name_tool -add_rpath $F/lib target/debug/web   # again after each build
+target/debug/web
 ```
 
-Then open http://127.0.0.1:8189/ in Safari, Chrome or Firefox, or run the
-Playwright script. `run.mjs` also accepts `webkit`
-(`node run.mjs http://127.0.0.1:8189 chromium,firefox,webkit`), but that is
-untested: Playwright's WebKit didn't install on the Linux test machine.
-macOS may ask whether `web` may accept incoming connections; allow it.
+Then open http://127.0.0.1:8189/. With Homebrew's GStreamer
+(`brew install gstreamer libnice-gstreamer pkgconf`), `cargo run` should
+work without the rpath; that is untested. `run.mjs` also accepts `webkit`
+(`node run.mjs http://127.0.0.1:8189 chromium,firefox,webkit`), also
+untested. macOS may ask whether `web` may accept incoming connections;
+allow it.
 
 ## Side finding: webrtcsink deadlocks without BUNDLE
 
@@ -254,8 +221,8 @@ m-line, `whepserversink` deadlocks once the session starts, on both `main`
 and the fork. The repro disables congestion control to get around it.
 
 `start_session()` connects to webrtcbin's `request-aux-sender`, which is
-emitted once per transport. The handler (`net/webrtc/src/webrtcsink/imp.rs`,
-around line 3544, `main` 9cb42da34) locks `settings`, then sets
+emitted once per transport. The handler (`net/webrtc/src/webrtcsink/imp.rs`)
+locks `settings`, then sets
 `estimated-bitrate` on the shared congestion controller. That emits
 `notify::estimated-bitrate` synchronously, and the handler connected on the
 previous call runs `set_bitrate()`, which locks `settings` again:

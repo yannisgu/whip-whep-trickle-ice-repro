@@ -42,7 +42,7 @@ fn main() -> Result<()> {
         *candidates.entry(trickled.mline).or_default() += 1;
     }
     let edge_cases = runtime.block_on(async {
-        let edge_cases = client.edge_cases(&server.base).await?;
+        let edge_cases = client.edge_cases(&server.base, &server.trickled).await?;
         tokio::time::sleep(Duration::from_millis(300)).await;
         anyhow::Ok(edge_cases)
     })?;
@@ -58,8 +58,11 @@ fn main() -> Result<()> {
     let ok = trickled.iter().filter(|s| s.is_success()).count();
     println!("trickled candidates accepted: {ok}/{}", trickled.len());
     println!("candidates handed to the server's webrtcbin, per m-line: {candidates:?}");
-    for (what, status) in edge_cases {
-        println!("{what}: {status}");
+    for case in edge_cases {
+        println!(
+            "{}: {}, handed to m-line(s) {:?}",
+            case.what, case.status, case.mlines
+        );
     }
     println!(
         "client ice-connection-state: {:?}",

@@ -25,9 +25,9 @@ pub mod client;
 pub mod server;
 
 pub const PLUGIN: &str = if cfg!(feature = "upstream") {
-    "upstream main (9cb42da34)"
+    "upstream main"
 } else {
-    "fork webrtc-whip-whep-trickle-ice (f9c7317b5)"
+    "fork webrtc-whip-whep-trickle-ice"
 };
 
 #[derive(Clone, Copy, PartialEq)]

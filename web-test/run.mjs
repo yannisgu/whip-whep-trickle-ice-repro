@@ -54,6 +54,11 @@ function report(browser, r) {
       `\n    mids ${r.mids.join(",")}, offer candidates ${r.offerCandidates}` +
       `\n    trickled per mid ${JSON.stringify(sentPerMid)}, PATCH statuses ${JSON.stringify(statuses)}` +
       `\n    handed to webrtcbin per m-line ${JSON.stringify(perMline)}, on the wrong m-line: ${wrong}` +
-      `\n    ICE connected after ${r.connectedMs ?? "-"} ms${r.error ? `, error: ${r.error}` : ""}`,
+      `\n    ICE connected after ${r.connectedMs ?? "-"} ms, ETag ${r.etag ?? "none"}${r.error ? `, error: ${r.error}` : ""}`,
   );
+  for (const e of r.edgeCases)
+    console.log(
+      `    ${e.ok ? "ok  " : "FAIL"} ${e.what}: ${e.status} m-line(s) ${JSON.stringify(e.mlines)}` +
+        (e.ok ? "" : `, fork expects ${e.expStatus} ${JSON.stringify(e.expMlines)}`),
+    );
 }

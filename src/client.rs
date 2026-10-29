@@ -23,6 +23,17 @@ pub struct Client {
     http: reqwest::Client,
     /// The offer and the session URL, once the server answered
     session: Option<(gst_sdp::SDPMessage, String)>,
+    /// The `ETag` of the server's answer, sent back in `If-Match`
+    etag: Option<String>,
+}
+
+/// The `If-Match` header of a PATCH
+#[derive(Clone, Copy)]
+enum IfMatch<'a> {
+    /// The `ETag` of the answer, if the server sent one
+    Etag,
+    None,
+    Value(&'a str),
 }
 
 impl Client {
@@ -128,6 +139,7 @@ impl Client {
             events,
             http: reqwest::Client::new(),
             session: None,
+            etag: None,
         })
     }
 
@@ -144,8 +156,9 @@ impl Client {
             "POST {endpoint}: offer with {} candidate(s)",
             count_candidates(&offer)
         );
-        let (resource, answer) = self.post_offer(&endpoint, &offer).await?;
-        log!("client", "201 Created, session {resource}");
+        let (resource, etag, answer) = self.post_offer(&endpoint, &offer).await?;
+        log!("client", "201 Created, session {resource}, ETag {etag:?}");
+        self.etag = etag;
         let answer = gst_sdp::SDPMessage::parse_buffer(answer.as_bytes())?;
         self.webrtcbin.emit_by_name::<()>(
             "set-remote-description",
@@ -167,12 +180,12 @@ impl Client {
                     // webrtcbin's end of gathering
                     Some(Event::Candidate(mline, candidate)) if candidate.is_empty() => {
                         let frag = sdpfrag(&offer, mline, &["end-of-candidates"], None);
-                        let status = self.patch(&resource, &frag).await?;
+                        let status = self.patch(&resource, &frag, IfMatch::Etag).await?;
                         log!("client", "PATCH m-line {mline} (mid {}) end-of-candidates -> {status}", mid(&offer, mline));
                     }
                     Some(Event::Candidate(mline, candidate)) => {
                         let frag = sdpfrag(&offer, mline, &[&candidate], None);
-                        let status = self.patch(&resource, &frag).await?;
+                        let status = self.patch(&resource, &frag, IfMatch::Etag).await?;
                         log!("client", "PATCH m-line {mline} (mid {}) {candidate} -> {status}", mid(&offer, mline));
                         trickled.push(status);
                     }
@@ -187,37 +200,86 @@ impl Client {
         Ok(trickled)
     }
 
-    /// PATCHes a fragment with only the candidates of the last media section,
-    /// an ICE restart, and an unknown session
-    pub async fn edge_cases(&self, base: &str) -> Result<Vec<(String, reqwest::StatusCode)>> {
+    /// PATCHes the cases besides plain trickling, one at a time, and returns
+    /// each one's status and the m-lines of the candidates the server's
+    /// signaller handed to webrtcbin for it
+    pub async fn edge_cases(
+        &self,
+        base: &str,
+        trickled: &Mutex<Vec<crate::server::Trickled>>,
+    ) -> Result<Vec<EdgeCase>> {
         let (offer, resource) = self.session.as_ref().context("no session")?;
         let last = offer.medias_len() - 1;
         let fake = "candidate:9999 1 UDP 2122260223 192.0.2.1 50000 typ host";
-        let mut edge_cases = vec![];
+        let restart = Some(("restart", "restartrestartrestartrestart"));
+        let unknown = format!("{base}/resource/does-not-exist");
+
+        let mut cases = vec![];
         if last > 0 {
-            let frag = sdpfrag(offer, last, &[fake], None);
-            edge_cases.push((
+            cases.push((
                 format!(
                     "fragment with only mid {} (m-line {last})",
                     mid(offer, last)
                 ),
-                self.patch(resource, &frag).await?,
+                resource.as_str(),
+                sdpfrag(offer, last, &[fake], None),
+                IfMatch::Etag,
             ));
         }
-        let frag = sdpfrag(
-            offer,
-            0,
-            &[fake],
-            Some(("restart", "restartrestartrestartrestart")),
-        );
-        edge_cases.push((
-            "ICE restart (new ice-ufrag)".into(),
-            self.patch(resource, &frag).await?,
-        ));
-        let frag = sdpfrag(offer, 0, &[fake], None);
-        let unknown = format!("{base}/resource/does-not-exist");
-        edge_cases.push(("unknown session".into(), self.patch(&unknown, &frag).await?));
+        cases.extend([
+            (
+                "candidate before the first m= line, no m= line".to_string(),
+                resource.as_str(),
+                session_sdpfrag(offer, &[fake]),
+                IfMatch::Etag,
+            ),
+            (
+                "If-Match: *".into(),
+                resource.as_str(),
+                sdpfrag(offer, 0, &[fake], None),
+                IfMatch::Value("*"),
+            ),
+            (
+                "no If-Match".into(),
+                resource.as_str(),
+                sdpfrag(offer, 0, &[fake], None),
+                IfMatch::None,
+            ),
+            (
+                "wrong If-Match".into(),
+                resource.as_str(),
+                sdpfrag(offer, 0, &[fake], None),
+                IfMatch::Value("\"wrong\""),
+            ),
+            (
+                "ICE restart (new ice-ufrag)".into(),
+                resource.as_str(),
+                sdpfrag(offer, 0, &[fake], restart),
+                IfMatch::Etag,
+            ),
+            (
+                "unknown session".into(),
+                unknown.as_str(),
+                sdpfrag(offer, 0, &[fake], None),
+                IfMatch::Etag,
+            ),
+        ]);
 
+        let mut edge_cases = vec![];
+        for (what, url, frag, if_match) in cases {
+            let before = trickled.lock().unwrap().len();
+            let status = self.patch(url, &frag, if_match).await?;
+            // The signaller emits handle-ice before it answers
+            let mlines = trickled.lock().unwrap()[before..]
+                .iter()
+                .map(|t| t.mline)
+                .collect();
+            edge_cases.push(EdgeCase {
+                what,
+                status,
+                mlines,
+            });
+        }
         Ok(edge_cases)
     }
 
@@ -226,7 +288,7 @@ impl Client {
         &self,
         endpoint: &str,
         offer: &gst_sdp::SDPMessage,
-    ) -> Result<(String, String)> {
+    ) -> Result<(String, Option<String>, String)> {
         // The server's HTTP listener comes up with its pipeline
         for _ in 0..50 {
             let resp = match self
@@ -253,21 +315,46 @@ impl Client {
                 .to_str()?
                 .to_string();
             let resource = resp.url().join(&location)?.to_string();
-            return Ok((resource, resp.text().await?));
+            let etag = resp
+                .headers()
+                .get("etag")
+                .map(|etag| etag.to_str())
+                .transpose()?
+                .map(str::to_string);
+            return Ok((resource, etag, resp.text().await?));
         }
         bail!("server not reachable")
     }
 
-    async fn patch(&self, url: &str, frag: &str) -> Result<reqwest::StatusCode> {
-        Ok(self
+    async fn patch(
+        &self,
+        url: &str,
+        frag: &str,
+        if_match: IfMatch<'_>,
+    ) -> Result<reqwest::StatusCode> {
+        let mut req = self
             .http
             .patch(url)
             .header("Content-Type", "application/trickle-ice-sdpfrag")
-            .body(frag.to_string())
-            .send()
-            .await?
-            .status())
+            .body(frag.to_string());
+        let if_match = match if_match {
+            IfMatch::Etag => self.etag.as_deref(),
+            IfMatch::None => None,
+            IfMatch::Value(value) => Some(value),
+        };
+        if let Some(if_match) = if_match {
+            req = req.header("If-Match", if_match);
+        }
+        Ok(req.send().await?.status())
     }
+}
+
+/// A PATCH besides plain trickling
+pub struct EdgeCase {
+    pub what: String,
+    pub status: reqwest::StatusCode,
+    /// The m-lines the server's signaller handed its candidates to
+    pub mlines: Vec<u32>,
 }
 
 /// An `application/trickle-ice-sdpfrag` body (RFC 8840) with `candidates` for
@@ -298,6 +385,28 @@ fn sdpfrag(
         media.proto().unwrap(),
         media.formats().next().unwrap_or("0"),
         media.attribute_val("mid").unwrap(),
+    );
+    for candidate in candidates {
+        frag += &format!("a={candidate}\r\n");
+    }
+    frag
+}
+
+/// An `application/trickle-ice-sdpfrag` body with `candidates` in the
+/// session part, before any `m=` line, and the session-level ICE
+/// credentials, or those of the first media section
+fn session_sdpfrag(offer: &gst_sdp::SDPMessage, candidates: &[&str]) -> String {
+    let media = offer.media(0).unwrap();
+    let attr = |name| {
+        offer
+            .attribute_val(name)
+            .or(media.attribute_val(name))
+            .unwrap()
+    };
+    let mut frag = format!(
+        "a=ice-ufrag:{}\r\na=ice-pwd:{}\r\n",
+        attr("ice-ufrag"),
+        attr("ice-pwd")
     );
     for candidate in candidates {
         frag += &format!("a={candidate}\r\n");

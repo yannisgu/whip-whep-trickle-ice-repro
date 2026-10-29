@@ -37,12 +37,15 @@
 <table id="patches"><tr><th>time</th><th>mid</th><th>candidate</th><th>status</th></tr></table>
 <h3>Candidates the server handed to webrtcbin</h3>
 <table id="server"><tr><th>m-line</th><th>mid</th><th>candidate</th><th>expected m-line</th></tr></table>
+<h3>Edge cases</h3>
+<p>Sent after trickling, one at a time. Green: what the fork should answer.</p>
+<table id="edge"><tr><th>case</th><th>status</th><th>handed to m-line(s)</th><th>fork expects</th></tr></table>
 <h3>Log</h3>
 <pre id="log"></pre>
 
 <script>
 const $ = (id) => document.getElementById(id);
-let pc, resource, t0, stopDrawing;
+let pc, resource, etag, t0, stopDrawing;
 // Read by the Playwright test
 window.reproResult = null;
 
@@ -121,13 +124,13 @@ async function start() {
   $("stop").disabled = false;
   $("log").textContent = "";
   $("summary").innerHTML = "";
-  for (const t of ["patches", "server"]) while ($(t).rows.length > 1) $(t).deleteRow(1);
+  for (const t of ["patches", "server", "edge"]) while ($(t).rows.length > 1) $(t).deleteRow(1);
   t0 = performance.now();
 
   const result = (window.reproResult = {
     proto, trickle, nobundle, plugin: (await info).plugin,
     offerCandidates: 0, patches: [], connectedMs: null, gatheringCompleteMs: null,
-    session: null, mids: [], server: [], done: false, error: null,
+    session: null, etag: null, mids: [], server: [], edgeCases: [], done: false, error: null,
   });
 
   try {
@@ -158,11 +161,7 @@ async function start() {
     const patch = (mid, line) => {
       sent = sent.then(async () => {
         const section = sections(pc.localDescription.sdp).find((s) => s.mid == mid);
-        const resp = await fetch(resource, {
-          method: "PATCH",
-          headers: { "Content-Type": "application/trickle-ice-sdpfrag" },
-          body: sdpfrag(section, [line]),
-        });
+        const resp = await patchRequest(resource, sdpfrag(section, [line]), etag);
         const p = { ms: ms(), mid, candidate: line, status: resp.status };
         result.patches.push(p);
         row("patches", [`${(p.ms / 1000).toFixed(3)}s`, mid, line, resp.status], resp.ok ? "good" : "bad");
@@ -197,8 +196,9 @@ async function start() {
     });
     if (resp.status != 201) throw new Error(`POST: ${resp.status} ${await resp.text()}`);
     resource = resp.headers.get("Location");
+    etag = result.etag = resp.headers.get("ETag");
     result.session = resource.split("/").pop();
-    log(`${resp.status}, session ${resource}`);
+    log(`${resp.status}, session ${resource}, ETag ${etag}`);
     await pc.setRemoteDescription({ type: "answer", sdp: await resp.text() });
     for (const [mid, line] of pending.splice(0)) patch(mid, line);
 
@@ -218,12 +218,48 @@ async function start() {
           t.expected == null || t.expected == t.mline ? "good" : "bad");
     }
     summarize(result);
+    await edgeCases(result);
   } catch (err) {
     result.error = String(err);
     log(`error: ${err}`);
     $("summary").innerHTML = `<p class="bad">Error: ${err}</p>`;
   }
   result.done = true;
+}
+
+function patchRequest(url, body, ifMatch) {
+  const headers = { "Content-Type": "application/trickle-ice-sdpfrag" };
+  if (ifMatch != null) headers["If-Match"] = ifMatch;
+  return fetch(url, { method: "PATCH", headers, body });
+}
+
+// The PATCHes besides plain trickling, with what the fork answers
+async function edgeCases(r) {
+  const secs = sections(pc.localDescription.sdp);
+  const last = secs.length - 1;
+  const fake = "a=candidate:9999 1 UDP 2122260223 192.0.2.1 50000 typ host";
+  const session = (lines) =>
+    [`a=ice-ufrag:${secs[0].ufrag}`, `a=ice-pwd:${secs[0].pwd}`, ...lines].join("\r\n") + "\r\n";
+  const restart = { ...secs[0], ufrag: "restart", pwd: "restartrestartrestartrestart" };
+  const cases = [
+    [`fragment with only mid ${secs[last].mid} (m-line ${last})`, resource, sdpfrag(secs[last], [fake]), etag, 204, [last]],
+    ["candidate before the first m= line, no m= line", resource, session([fake]), etag, 204, [0]],
+    ["If-Match: *", resource, sdpfrag(secs[0], [fake]), "*", 204, [0]],
+    ["no If-Match", resource, sdpfrag(secs[0], [fake]), null, 428, []],
+    ["wrong If-Match", resource, sdpfrag(secs[0], [fake]), '"wrong"', 412, []],
+    ["ICE restart (new ice-ufrag)", resource, sdpfrag(restart, [fake]), etag, 422, []],
+    ["unknown session", resource.replace(/[^/]+$/, "does-not-exist"), sdpfrag(secs[0], [fake]), etag, 404, []],
+  ];
+  const handed = async () => (await (await fetch(`/repro/session/${r.session}`)).json()).length;
+  for (const [what, url, body, ifMatch, expStatus, expMlines] of cases) {
+    const before = await handed();
+    const status = (await patchRequest(url, body, ifMatch)).status;
+    const all = await (await fetch(`/repro/session/${r.session}`)).json();
+    const mlines = all.slice(before).map((t) => t.mline);
+    const ok = status == expStatus && JSON.stringify(mlines) == JSON.stringify(expMlines);
+    r.edgeCases.push({ what, status, mlines, expStatus, expMlines, ok });
+    row("edge", [what, status, JSON.stringify(mlines), `${expStatus} ${JSON.stringify(expMlines)}`], ok ? "good" : "bad");
+  }
 }
 
 function summarize(r) {

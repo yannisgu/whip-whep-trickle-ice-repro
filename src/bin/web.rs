@@ -98,8 +98,10 @@ async fn proxy(
         .http
         .request(method, format!("{origin}{}", uri.path()))
         .body(body);
-    if let Some(content_type) = headers.get("content-type") {
-        req = req.header("content-type", content_type);
+    for name in ["content-type", "if-match"] {
+        if let Some(value) = headers.get(name) {
+            req = req.header(name, value);
+        }
     }
     let resp = match req.send().await {
         Ok(resp) => resp,
